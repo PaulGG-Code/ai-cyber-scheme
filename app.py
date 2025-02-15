@@ -9,8 +9,8 @@ from langchain.document_loaders import PyPDFLoader, TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import FAISS
-from langchain.llms import OpenAI
-from langchain.chat_models import ChatOpenAI
+from langchain.llms import OpenAI, HuggingFaceHub
+from langchain.chat_models import ChatOpenAI,  ChatAnthropic
 from langchain_experimental.agents import create_pandas_dataframe_agent
 from langchain.chains import RetrievalQA
 from langchain.docstore.document import Document
@@ -175,7 +175,38 @@ def fetch_hierarchy(df: pd.DataFrame, main_ref: str) -> pd.DataFrame:
 # -------------------------------------------------------------------
 # 4. Multi-LLM Selection Helper
 # -------------------------------------------------------------------
-def get_llm(model_name: str, openai_api_key: str):
+def get_llm(model_name: str, openai_api_key: str = None, anthropic_api_key: str = None, huggingfacehub_api_key: str = None):
+    if model_name == "GPT-3.5":
+        return ChatOpenAI(
+            temperature=0,
+            model_name="gpt-3.5-turbo",
+            openai_api_key=openai_api_key
+        )
+    elif model_name == "GPT-4":
+        return ChatOpenAI(
+            temperature=0,
+            model_name="gpt-4",
+            openai_api_key=openai_api_key
+        )
+    elif model_name == "Claude 2":
+        return ChatAnthropic(
+            temperature=0,
+            anthropic_api_key=anthropic_api_key,
+            model_name="claude-v2"
+        )
+    elif model_name == "Mistral Large":
+        return HuggingFaceHub(
+            repo_id="mistralai/mistral-large",
+            huggingfacehub_api_token=huggingfacehub_api_key,
+            model_kwargs={"temperature": 0}
+        )
+    else:
+        # Fallback to GPT-3.5 if an unknown option is selected.
+        return ChatOpenAI(
+            temperature=0,
+            model_name="gpt-3.5-turbo",
+            openai_api_key=openai_api_key
+        )
     """
     Returns a LangChain LLM or Chat model instance 
     depending on the user's choice in the sidebar.
@@ -337,27 +368,43 @@ def handle_pdf_text_uploads(openai_api_key: str, selected_llm_name: str):
 # -------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Scheme AI App", layout="wide")
-
     st.title("Scheme AI: Excel Datasets + PDF/Text Q&A")
     st.write("Choose a data source in the sidebar. Also pick which LLM you want to use.")
 
     # ---- Sidebar Configuration ----
     st.sidebar.title("Configuration")
-    openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
-    data_source = st.sidebar.selectbox("Data Source", ["Excel Datasets", "PDF/Text Files"])
     model_choice = st.sidebar.selectbox(
         "LLM Model",
         ["GPT-3.5", "GPT-4", "Claude 2", "Mistral Large"],
         index=0
     )
+    
+    # Show the appropriate API key input field based on the selected model.
+    if model_choice in ["GPT-3.5", "GPT-4"]:
+        openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
+        anthropic_api_key = None
+        huggingfacehub_api_key = None
+    elif model_choice == "Claude 2":
+        anthropic_api_key = st.sidebar.text_input("Anthropic API Key", type="password")
+        openai_api_key = None
+        huggingfacehub_api_key = None
+    elif model_choice == "Mistral Large":
+        huggingfacehub_api_key = st.sidebar.text_input("HuggingFace Hub API Key", type="password")
+        openai_api_key = None
+        anthropic_api_key = None
 
-    if not openai_api_key:
-        st.warning("Please provide an OpenAI API key in the sidebar.")
+    data_source = st.sidebar.selectbox("Data Source", ["Excel Datasets", "PDF/Text Files"])
+
+    # Check if the required API key has been provided.
+    if (model_choice in ["GPT-3.5", "GPT-4"] and not openai_api_key) or \
+       (model_choice == "Claude 2" and not anthropic_api_key) or \
+       (model_choice == "Mistral Large" and not huggingfacehub_api_key):
+        st.warning("Please provide the appropriate API key for the selected model in the sidebar.")
         return
 
-    # ============== EXCEL DATASETS FLOW ==============
+    # ================= Excel Datasets Flow =================
     if data_source == "Excel Datasets":
-        # Let user pick from your original 3 excel files
+        # Let the user pick from the available Excel datasets
         dataset_options = {
             "OWASP MASVS v2.1.0": "owasp-masvs-v2.1.0.xlsx",
             "CRA Regulation Annexes": "cra-regulation-annexes.xlsx",
@@ -366,7 +413,7 @@ def main():
         dataset_choice = st.selectbox("Select a Dataset", list(dataset_options.keys()))
         data_file = dataset_options.get(dataset_choice)
 
-        # Load the data
+        # Load the data from the selected file
         try:
             dataframes = load_data(data_file)
             if dataset_choice == "OWASP MASVS v2.1.0":
@@ -377,7 +424,6 @@ def main():
                 df = preprocess_ai_act_data(dataframes)
             else:
                 df = pd.DataFrame()
-
             st.write(f"Loaded dataset: **{dataset_choice}** with sheets: {list(dataframes.keys())}")
         except Exception as e:
             st.error(f"Failed to load dataset. Error: {e}")
@@ -387,7 +433,7 @@ def main():
             st.error("The chosen dataset is empty or could not be loaded.")
             return
 
-        # If CRA, show hierarchical filter
+        # --- Dataset-specific UI ---
         if dataset_choice == "CRA Regulation Annexes":
             main_ref = st.text_input("Enter a main requirement ID (e.g. '1', '1.1')").strip()
             if main_ref:
@@ -403,7 +449,6 @@ def main():
                 except Exception as e:
                     st.error(f"Error fetching hierarchy: {e}")
 
-        # If AI Act, allow user to pick depth + show tree
         if dataset_choice == "AI Act Directive":
             depth = st.number_input("Enter depth level (e.g., 1, 2):", min_value=1, step=1)
             if depth:
@@ -416,12 +461,11 @@ def main():
                         st.warning(f"No sections found for depth '{depth}'.")
                 except Exception as e:
                     st.error(f"Error fetching AI Act by depth: {e}")
-
-            # Show natural order tree
+            # Also display the hierarchical view using natural ordering
             show_ai_act_hierarchy(df)
 
-        # Finally, let user ask questions to the excel-based agent
-        llm = get_llm(model_choice, openai_api_key)
+        # Create the LLM instance using all relevant API keys.
+        llm = get_llm(model_choice, openai_api_key, anthropic_api_key, huggingfacehub_api_key)
         agent = create_agent(df, llm=llm, verbose=False)
 
         user_question = st.text_input("Ask a question about this Excel data:")
@@ -430,7 +474,7 @@ def main():
                 with st.spinner("Generating answer..."):
                     try:
                         answer = agent.invoke(user_question)
-                        # answer can be a string or a DataFrame
+                        # Answer may be a DataFrame, dict, or string.
                         if isinstance(answer, pd.DataFrame):
                             st.dataframe(answer)
                         elif isinstance(answer, dict) and "output" in answer:
@@ -442,8 +486,12 @@ def main():
             else:
                 st.warning("Please enter a valid question.")
 
-    # ============== PDF/TEXT FILE UPLOAD FLOW ==============
+    # ================= PDF/Text Files Flow =================
     else:
+        # In the PDF/Text flow, we'll reuse the handle_pdf_text_uploads helper.
+        # Note: You may wish to update that helper to pass the additional API keys.
+        # For simplicity, here we pass the OpenAI key if available (for GPT models)
+        # or rely on the model_choice within the helper.
         handle_pdf_text_uploads(openai_api_key, model_choice)
 
 if __name__ == "__main__":
