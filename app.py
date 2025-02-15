@@ -14,11 +14,12 @@ from langchain.chat_models import ChatOpenAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
 from langchain.chains import RetrievalQA
 from langchain.docstore.document import Document
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
 
 # -------------------------------------------------------------------
 # 1. Utility functions for building a hierarchical tree from ref_id
 # -------------------------------------------------------------------
-
 def natural_sort_key(ref_id: str):
     """
     A 'natural' sort key that splits the string into digit and non-digit chunks.
@@ -27,7 +28,6 @@ def natural_sort_key(ref_id: str):
       - (1, integer) for numeric chunks
     Example: "Article 10" -> [ (0, 'article '), (1, 10) ]
     """
-    import re
     parts = re.split(r'(\d+)', ref_id)
     sort_key = []
     for part in parts:
@@ -123,7 +123,6 @@ def show_ai_act_hierarchy(df: pd.DataFrame):
 # -------------------------------------------------------------------
 # 2. Data Loading and Preprocessing
 # -------------------------------------------------------------------
-
 def load_data(filepath: str) -> dict:
     excel_data = pd.ExcelFile(filepath)
     return {sheet: excel_data.parse(sheet) for sheet in excel_data.sheet_names}
@@ -180,9 +179,6 @@ def get_llm(model_name: str, openai_api_key: str):
     """
     Returns a LangChain LLM or Chat model instance 
     depending on the user's choice in the sidebar.
-    
-    In production, replace placeholders (Claude 2, Mistral Large)
-    with actual integrations or fallback as needed.
     """
     if model_name == "GPT-3.5":
         return ChatOpenAI(
@@ -198,8 +194,6 @@ def get_llm(model_name: str, openai_api_key: str):
         )
     elif model_name == "Claude 2":
         # Placeholder for Anthropic's Claude model
-        # e.g. from langchain.llms import Anthropic
-        # return Anthropic(model="claude-2", api_key=YOUR_ANTHROPIC_KEY, ...)
         return OpenAI(
             temperature=0,
             openai_api_key=openai_api_key,
@@ -213,7 +207,6 @@ def get_llm(model_name: str, openai_api_key: str):
             model_name="gpt-3.5-turbo"  # fallback
         )
     else:
-        # Default
         return ChatOpenAI(
             temperature=0,
             model_name="gpt-3.5-turbo",
@@ -225,8 +218,7 @@ def get_llm(model_name: str, openai_api_key: str):
 # -------------------------------------------------------------------
 def create_agent(df: pd.DataFrame, llm, verbose=False):
     """
-    Original function modified to accept an LLM object,
-    instead of openai_api_key + model_name. 
+    Modified to accept an LLM object directly.
     We'll use that LLM in the create_pandas_dataframe_agent.
     """
     return create_pandas_dataframe_agent(llm, df, verbose=verbose, allow_dangerous_code=True)
@@ -257,13 +249,15 @@ def build_vectorstore_from_docs(docs, openai_api_key: str):
 def handle_pdf_text_uploads(openai_api_key: str, selected_llm_name: str):
     """
     Let user upload PDFs or TXT files, build a vectorstore, and
-    allow Q&A with chosen LLM. 
+    allow conversational Q&A with the chosen LLM.
     """
     st.subheader("Upload PDF or Text files for Q&A")
+    # Added a unique key to avoid duplicate element IDs
     uploaded_files = st.file_uploader(
         "Upload one or more PDF or Text files",
         type=["pdf", "txt"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        key="pdf_text_upload_key"
     )
 
     if "file_qa_chain" not in st.session_state:
@@ -272,7 +266,7 @@ def handle_pdf_text_uploads(openai_api_key: str, selected_llm_name: str):
     if uploaded_files:
         all_docs = []
         for uploaded_file in uploaded_files:
-            # Save file to temp
+            # Save file to a temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix=uploaded_file.name) as tmp_file:
                 tmp_file.write(uploaded_file.getvalue())
                 temp_file_path = tmp_file.name
@@ -282,25 +276,26 @@ def handle_pdf_text_uploads(openai_api_key: str, selected_llm_name: str):
                 loader = PyPDFLoader(temp_file_path)
                 file_docs = loader.load()  # List of Document objects
             else:
-                # .txt
+                # For .txt files
                 loader = TextLoader(temp_file_path, encoding="utf-8")
                 file_docs = loader.load()
 
-            # You can remove the temp file if you want after loading
-            # os.remove(temp_file_path)
+            # Optionally remove the temporary file after processing
+            os.remove(temp_file_path)
 
             all_docs.extend(file_docs)
 
-        # Build vector store
+        # Build a vector store from the uploaded documents
         vectorstore = build_vectorstore_from_docs(all_docs, openai_api_key)
-        # Create retrieval-based QA chain
+        # Get the selected LLM
         llm = get_llm(selected_llm_name, openai_api_key)
-        retriever = vectorstore.as_retriever(search_kwargs={"k":3})
-        file_qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            retriever=retriever,
-            return_source_documents=True
-        )
+        # Create a retriever from the vectorstore (retrieves top 3 matching chunks)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+        
+        # Set up conversation memory for multi-turn interactions
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        # Create a ConversationalRetrievalChain for interactive Q&A
+        file_qa_chain = ConversationalRetrievalChain.from_llm(llm, retriever=retriever, memory=memory)
 
         st.session_state["file_qa_chain"] = file_qa_chain
         st.success("Vector store created for uploaded files. You can now ask questions below.")
@@ -310,14 +305,30 @@ def handle_pdf_text_uploads(openai_api_key: str, selected_llm_name: str):
         if st.button("Ask (Files)"):
             if question.strip():
                 with st.spinner("Generating answer..."):
-                    result = st.session_state["file_qa_chain"](question)
-                    answer = result["result"]
-                    source_docs = result["source_documents"]
+                    result = st.session_state["file_qa_chain"]({"question": question})
+                    answer = result.get("answer", "No answer generated.")
                     st.markdown(f"**Answer:** {answer}")
-                    with st.expander("Source Documents"):
-                        for i, doc in enumerate(source_docs, start=1):
-                            st.markdown(f"**Source {i}:** {doc.metadata}")
-                            st.text(doc.page_content[:500])
+                    
+                    # Optionally display the conversation history
+                    chat_history = result.get("chat_history", [])
+                    with st.expander("Chat History"):
+                        for msg in chat_history:
+                            # Try to access role and content; if not present, fall back.
+                            try:
+                                role = msg.role
+                            except AttributeError:
+                                # Fallback: infer role from class name
+                                if msg.__class__.__name__ == "HumanMessage":
+                                    role = "human"
+                                elif msg.__class__.__name__ == "AIMessage":
+                                    role = "assistant"
+                                else:
+                                    role = "unknown"
+                            try:
+                                content = msg.content
+                            except AttributeError:
+                                content = str(msg)
+                            st.markdown(f"**{role.title()}:** {content}")
             else:
                 st.warning("Please enter a question.")
 
@@ -325,9 +336,9 @@ def handle_pdf_text_uploads(openai_api_key: str, selected_llm_name: str):
 # 7. Main Streamlit App (Combined)
 # -------------------------------------------------------------------
 def main():
-    st.set_page_config(page_title="Combined AI App", layout="wide")
+    st.set_page_config(page_title="Scheme AI App", layout="wide")
 
-    st.title("Combined App: Excel Datasets + PDF/Text Q&A")
+    st.title("Scheme AI: Excel Datasets + PDF/Text Q&A")
     st.write("Choose a data source in the sidebar. Also pick which LLM you want to use.")
 
     # ---- Sidebar Configuration ----
@@ -434,7 +445,6 @@ def main():
     # ============== PDF/TEXT FILE UPLOAD FLOW ==============
     else:
         handle_pdf_text_uploads(openai_api_key, model_choice)
-
 
 if __name__ == "__main__":
     main()
